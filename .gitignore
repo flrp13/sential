@@ -1,0 +1,34 @@
+# --- Environment & Virtual Envs ---
+.venv/
+env/
+venv/
+ENV/
+.env
+*.env
+
+# --- Python Bytecode & Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipydb_checkpoints/
+
+# --- Build & Distribution ---
+dist/
+build/
+*.egg-info/
+nosetests.xml
+coverage.xml
+.coverage
+htmlcov/
+
+# --- Databases (Common for FastAPI/SQLAlchemy) ---
+*.db
+*.sqlite3
+
+# --- OS & Editor Files ---
+.DS_Store
+.vscode/
+.idea/
