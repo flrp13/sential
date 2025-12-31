@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Final, Mapping, TypedDict
+from typing import Final, Mapping, Tuple, TypedDict
 
 
 class SupportedLanguages(StrEnum):
@@ -23,7 +23,7 @@ LANGUAGES_HEURISTICS: Final[Mapping[SupportedLanguages, LanguagesHeuristics]] = 
                 "requirements.txt",
                 "pyproject.toml",
                 "setup.py",
-                "Pipfile",
+                "pipfile",
                 "tox.ini",
             }
         ),
@@ -66,7 +66,7 @@ LANGUAGES_HEURISTICS: Final[Mapping[SupportedLanguages, LanguagesHeuristics]] = 
                 ".fsproj",
                 ".vbproj",
                 "global.json",
-                "NuGet.config",
+                "nuget.config",
             }
         ),
         "extensions": frozenset({".cs", ".fs", ".vb", ".cshtml", ".razor"}),
@@ -85,8 +85,7 @@ LANGUAGES_HEURISTICS: Final[Mapping[SupportedLanguages, LanguagesHeuristics]] = 
     SupportedLanguages.CPP: {
         "manifests": frozenset(
             {
-                "CMakeLists.txt",
-                "Makefile",
+                "cmakelists.txt",
                 "makefile",
                 "configure.ac",
                 "meson.build",
@@ -130,4 +129,28 @@ CTAGS_KINDS = frozenset(
         "module",
         "package",
     }
+)
+
+# A static list of files that, if they exist, define the "Soul" of a project.
+# We check these regardless of the programming language.
+UNIVERSAL_CONTEXT_FILES: Tuple[str, ...] = (
+    # Documentation & Intent (The "Why")
+    "readme.md",
+    "readme.txt",
+    "architecture.md",
+    "contributing.md",
+    "design.md",
+    # AI Specific Instructions (The "How" - Extremely High Signal)
+    "claude.md",
+    ".cursorrules",
+    ".windsurfrules",
+    # Environment / Config Templates (The "Infrastructure")
+    ".env.example",
+    ".env.template",
+    "docker-compose.yml",
+    "dockerfile",
+    "makefile",
+    "justfile",
+    "rakefile",
+    "procfile",
 )

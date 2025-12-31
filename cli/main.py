@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
-from typing import Generator, List, Annotated, Tuple
+from typing import FrozenSet, Generator, List, Annotated, Set, Tuple
 import typer
 from rich import print as pr
 from rich.progress import (
@@ -22,9 +22,11 @@ from ctags import get_ctags_path
 
 from constants import (
     CTAGS_KINDS,
+    UNIVERSAL_CONTEXT_FILES,
     SupportedLanguages,
     LANGUAGES_HEURISTICS,
 )
+from utils import debug
 
 FilePath = Annotated[str, "A valid filesystem path"]
 
@@ -81,10 +83,16 @@ def main(
     pr(f"[green]Scanning: {path}...[/green]\n")
 
     scopes = select_scope(path, SupportedLanguages(language))
-    inventory_file, file_count = get_final_inventory_file(
+    lang_inventory_path, context_inventory_path, file_count = get_final_inventory_file(
         path, scopes, SupportedLanguages(language)
     )
-    tags_map = generate_tags_jsonl(path, inventory_file, file_count)
+    tags_map = generate_tags_jsonl(
+        path,
+        lang_inventory_path,
+        context_inventory_path,
+        file_count,
+        SupportedLanguages(language),
+    )
     print(tags_map)
 
 
@@ -97,13 +105,13 @@ def get_focused_inventory(
     # 1. Get the stream (Lazy)
     raw_stream = stream_git_inventory(base_path)
 
-    manifests_list = LANGUAGES_HEURISTICS[language]["manifests"]
+    manifests = LANGUAGES_HEURISTICS[language]["manifests"]
 
     for file_path in raw_stream:
         file_name = os.path.basename(file_path)
         rel_path = os.path.dirname(file_path)
 
-        if file_name in manifests_list:
+        if file_name.lower() in manifests:
             yield rel_path
 
 
@@ -190,7 +198,7 @@ def make_language_selection() -> SupportedLanguages:
 
 def get_final_inventory_file(
     base_path: FilePath, scopes: List[FilePath], language: SupportedLanguages
-) -> Tuple[FilePath, int]:
+) -> Tuple[FilePath, FilePath, int]:
     """
     1. Asks Git for files ONLY in the selected scopes.
     2. Filters them by the language's allowed extensions.
@@ -199,6 +207,12 @@ def get_final_inventory_file(
 
     # Get the allowed extensions (e.g., {'.js', '.ts'})
     allowed_extensions = LANGUAGES_HEURISTICS[language]["extensions"]
+
+    # Create the fast lookup set for the Reader (O(1) checks)
+    # This is what we pass to read_file_content_smart
+    tier_1_set: frozenset[str] = (
+        frozenset(UNIVERSAL_CONTEXT_FILES) | LANGUAGES_HEURISTICS[language]["manifests"]
+    )
 
     # Construct the command: git ls-files ... -- path1 path2
     # The "--" separator tells git "everything after this is a path"
@@ -216,7 +230,11 @@ def get_final_inventory_file(
     file_count = 0
     filtered_count = 0
 
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as tmp:
+    with tempfile.NamedTemporaryFile(
+        mode="w", delete=False, encoding="utf-8"
+    ) as lang_file, tempfile.NamedTemporaryFile(
+        mode="w", delete=False, encoding="utf-8"
+    ) as context_file:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -241,6 +259,7 @@ def get_final_inventory_file(
                 if process.stdout:
                     for file_path in process.stdout:
                         file_path = file_path.strip()
+                        file_name = os.path.basename(file_path).strip().lower()
                         file_count += 1
 
                         # Advance the raw counter
@@ -249,13 +268,26 @@ def get_final_inventory_file(
                         # SIEVE 2: Extension Check
                         # Check if file ends with one of our valid extensions
                         # We use endswith because extensions usually include the dot
-                        if any(file_path.endswith(ext) for ext in allowed_extensions):
-                            tmp.write(f"{file_path}\n")
-                            filtered_count += 1
-                            progress.update(
-                                task,
-                                description=f"[cyan]Kept {filtered_count} {language} files...",
-                            )
+                        if any(
+                            file_path.lower().endswith(ext)
+                            for ext in allowed_extensions
+                        ):
+                            lang_file.write(f"{file_path}\n")
+
+                        elif (
+                            file_name in tier_1_set
+                            or file_name.startswith("readme")
+                            or file_name.endswith(".md")
+                        ):
+                            context_file.write(f"{file_path}\n")
+                        else:
+                            continue
+
+                        filtered_count += 1
+                        progress.update(
+                            task,
+                            description=f"[cyan]Kept {filtered_count} {language} files...",
+                        )
 
                 process.wait()
 
@@ -266,16 +298,32 @@ def get_final_inventory_file(
                 completed=total_files,
             )
 
-        return tmp.name, filtered_count
+        return lang_file.name, context_file.name, filtered_count
 
 
 def generate_tags_jsonl(
-    base_path: str, inventory_path: FilePath, total_files: int
+    base_path: str,
+    inventory_path: FilePath,
+    context_path: FilePath,
+    total_files: int,
+    language: SupportedLanguages,
 ) -> FilePath:
 
     output_path = os.path.join(tempfile.gettempdir(), "sential_payload.jsonl")
 
     pr("\n[bold magenta]🏷️  Extracting code symbols...[/bold magenta]")
+
+    # Create the Ordered List for the Writer (Preserve Priority)
+    # We concatenate the tuples, then use dict.fromkeys to dedup while keeping order.
+    # This is O(N) and extremely fast.
+    ordered_candidates = list(
+        dict.fromkeys(
+            UNIVERSAL_CONTEXT_FILES + tuple(LANGUAGES_HEURISTICS[language]["manifests"])
+        )
+    )
+
+    # We also need the raw set for checking the reader limits later
+    tier_1_set = frozenset(ordered_candidates)
 
     ctags = get_ctags_path()
     cmd = [
@@ -305,9 +353,74 @@ def generate_tags_jsonl(
         ) as progress:
 
             task = progress.add_task(
-                f"[magenta]Parsing symbols from {total_files} files...", total=None
+                f"[magenta]Parsing symbols from {total_files} files...",
+                total=total_files,
             )
             with open(output_path, "w", encoding="utf-8") as out_f:
+
+                # --- PHASE 1: CONTEXT FILES (Full Content) ---
+
+                # A. Load valid context files found by Git into a set
+                valid_context_files: Set[str] = set()
+                with open(context_path, "r", encoding="utf-8") as f:
+                    valid_context_files = {
+                        file_path.strip() for file_path in f if file_path.strip()
+                    }
+
+                # B. The Priority Pass (Write the VIPs first)
+                # We take each candidate in order, maintaining prio
+                # candidates are names not relative paths
+                for candidate in ordered_candidates:
+                    # Find matches for this candidate
+                    # We create a list of matches so we don't modify the set while iterating
+                    matches = []
+                    for ctx_file_path in valid_context_files:
+
+                        if os.path.basename(ctx_file_path).lower() == candidate.lower():
+                            matches.append(ctx_file_path)
+
+                    # Sort matches by depth (Root files first!)
+                    # "package.json" (depth 0) comes before "backend/package.json" (depth 1)
+                    matches.sort(key=lambda p: p.count(os.sep))
+
+                    # Write them and remove from the pool
+                    if matches:
+                        for match in matches:
+                            full_path = os.path.join(base_path, match)
+                            content = read_file_content(full_path, tier_1_set)
+                            if content:
+                                ctx_record = {
+                                    "path": match,
+                                    "type": "context_file",
+                                    "content": content,
+                                }
+                                out_f.write(json.dumps(ctx_record) + "\n")
+                                progress.update(
+                                    task, description=f"[cyan]Included {match}..."
+                                )
+
+                            # Remove from the main set so it's not handled again
+                            valid_context_files.remove(match)
+
+                # We handle whatever was left, anything that didn't match prev step
+                leftovers = sorted(
+                    list(valid_context_files), key=lambda p: p.count(os.sep)
+                )
+                for leftover in leftovers:
+                    full_path = os.path.join(base_path, leftover)
+                    content = read_file_content(full_path, tier_1_set)
+
+                    if content:
+                        ctx_record = {
+                            "path": leftover,
+                            "type": "context_file",
+                            "content": content,
+                        }
+                        out_f.write(json.dumps(ctx_record) + "\n")
+                        progress.update(
+                            task, description=f"[cyan]Included {leftover}..."
+                        )
+
                 with open(inventory_path, "r", encoding="utf-8") as in_f:
                     # Use Popen to stream the output
                     with subprocess.Popen(
@@ -386,6 +499,13 @@ def generate_tags_jsonl(
             except OSError:
                 pass  # Ignore errors during cleanup
 
+        # Always clean up context file
+        if os.path.exists(context_path):
+            try:
+                os.remove(context_path)
+            except OSError:
+                pass  # Ignore errors during cleanup
+
         # Clean up output file if operation was interrupted or failed
         if not success and os.path.exists(output_path):
             try:
@@ -418,6 +538,44 @@ def count_git_files(base_path: str, cmd: List[str]) -> int:
                 count += 1
 
     return count
+
+
+def read_file_content(filepath: FilePath, tier_1_filenames: FrozenSet[str]) -> str:
+    """
+    Reads file content with intelligent truncation.
+    - Tier 1 (Manifests/Docs/AI Rules): 100k chars.
+    - Tier 2 (Standard Code): 50k chars.
+    """
+
+    filename = os.path.basename(filepath)
+
+    # We check agains what we've defined as tier 1 filenames
+    # allowing for readmes with different extensions and
+    # giving high confidence to .md files regardless
+    is_tier_1 = (
+        filename in tier_1_filenames
+        or filename.lower().startswith("readme")
+        or filename.endswith(".md")
+    )
+
+    limit = 100_000 if is_tier_1 else 50_000
+
+    try:
+        if not os.path.exists(filepath):
+            return ""
+        # We skip binary files
+        with open(filepath, "rb") as f:
+            if b"\0" in f.read(1024):
+                return ""
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(limit)
+            if len(content) == limit:
+                content += (
+                    f"\n\n... [TRUNCATED BY SENTIAL: File exceeded {limit} chars] ..."
+                )
+            return content
+    except Exception:
+        return ""
 
 
 if __name__ == "__main__":
