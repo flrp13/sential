@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Final, Mapping, Tuple, TypedDict
+from typing import Final, Mapping, TypedDict
 
 
 class SupportedLanguages(StrEnum):
@@ -133,7 +133,7 @@ CTAGS_KINDS = frozenset(
 
 # A static list of files that, if they exist, define the "Soul" of a project.
 # We check these regardless of the programming language.
-UNIVERSAL_CONTEXT_FILES: Tuple[str, ...] = (
+UNIVERSAL_CONTEXT_FILES: tuple[str, ...] = (
     # Documentation & Intent (The "Why")
     "readme.md",
     "readme.txt",

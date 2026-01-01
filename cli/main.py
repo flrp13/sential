@@ -1,13 +1,44 @@
 """
-This is a simple CLI tool that receives a path to a folder and lists all the files in it.
+Sential CLI Entry Point.
+
+This module implements the main command-line interface for Sential, a tool designed
+to generate high-signal context bridges from local Git repositories. It orchestrates
+the scanning pipeline by filtering files based on language-specific heuristics,
+scoping the scan to specific modules (monorepo support), and aggregating both
+raw file content (for context) and code symbols (via Universal Ctags).
+
+The pipeline operates in four distinct stages:
+
+1.  **Validation & Selection**: Verifies the target path is a valid Git repository
+    and handles interactive user selection for the target programming language and
+    application scopes (modules).
+2.  **Inventory Generation**: Streams the Git index to separate files into 'Language'
+    (source code) and 'Context' (manifests/docs) buckets using the "Language Sieve"
+    approach defined in `constants.py`.
+3.  **Content Extraction**: Reads high-priority context files in full (with intelligent
+    truncation) to establish the repository's configuration and documentation baseline.
+4.  **Symbol Extraction**: Pipes source files through Universal Ctags to extract structural
+    code symbols (classes, functions, definitions) without including full implementation
+    details, optimizing token usage for downstream consumption.
+
+Usage:
+    Run directly as a script or via the installed entry point.
+
+    $ python main.py --path /path/to/repo --language Python
+
+Dependencies:
+    - Typer: CLI argument parsing and app structure.
+    - Rich: Terminal UI, colors, and progress visualization.
+    - Inquirer: Interactive terminal user prompts.
+    - Universal Ctags: External engine used for symbol extraction.
 """
 
 import io
 import json
-import os
 import subprocess
 import tempfile
-from typing import FrozenSet, Generator, List, Annotated, Set, Tuple
+from pathlib import Path
+from typing import Annotated, Generator
 import typer
 from rich import print as pr
 from rich.progress import (
@@ -27,9 +58,7 @@ from constants import (
     SupportedLanguages,
     LANGUAGES_HEURISTICS,
 )
-from utils import debug
-
-FilePath = Annotated[str, "A valid filesystem path"]
+from utils import debug, is_binary_file
 
 app = typer.Typer()
 
@@ -37,11 +66,15 @@ app = typer.Typer()
 @app.command()
 def main(
     path: Annotated[
-        FilePath,
+        Path,
         typer.Option(
-            help="Root path from which Sential will start identifying modules"
+            exists=True,  # Typer throws error if path doesn't exist
+            file_okay=False,  # Typer throws error if it's a file, not a dir
+            dir_okay=True,  # Must be a directory
+            resolve_path=True,  # Automatically converts to absolute path
+            help="Root path from which Sential will start identifying modules",
         ),
-    ] = ".",
+    ] = Path("."),
     language: Annotated[
         str,
         typer.Option(
@@ -49,13 +82,24 @@ def main(
         ),
     ] = "",
 ):
-    """Main entry point"""
-    # Validate path is directory
-    if not os.path.isdir(path):
-        pr(
-            f"[red]Error:[/red] Not a valid path or not a directory: [green]'{path}'[/green]"
-        )
-        raise typer.Exit()
+    """
+    The main entry point for the Sential CLI application.
+
+    This function orchestrates the entire scanning process. It validates that the
+    provided path is a valid Git repository, determines the programming language
+    (either via arguments or user prompt), allows the user to select specific
+    application scopes (modules), and generates a final JSONL payload containing
+    context files and code symbols (ctags).
+
+    Args:
+        path (Path): The root directory of the codebase to scan. Must be an existing
+            directory and a valid Git repository. Defaults to the current working directory.
+        language (str): The target programming language for the scan. If not provided
+            via CLI arguments, the user will be prompted to select one interactively.
+
+    Raises:
+        typer.Exit: If the path is not a git repository or if an unsupported language is selected.
+    """
 
     # Validate path is git repository
     try:
@@ -99,29 +143,56 @@ def main(
 
 
 def get_focused_inventory(
-    base_path: FilePath, language: SupportedLanguages
-) -> Generator[FilePath, None, None]:
+    base_path: Path, language: SupportedLanguages
+) -> Generator[Path, None, None]:
     """
-    Consumes the git stream and applies the "Language Sieve" on the fly.
+    Scans the repository to identify potential module roots based on language-specific heuristics.
+
+    This generator consumes the raw Git file stream and applies a "Language Sieve."
+    It looks for specific manifest files (e.g., `package.json` for TypeScript, `Cargo.toml`
+    for Rust) defined in `LANGUAGES_HEURISTICS` to identify directories that represent
+    distinct modules or sub-projects within the repository.
+
+    Args:
+        base_path (Path): The absolute root path of the repository.
+        language (SupportedLanguages): The enum representing the selected programming language,
+            used to determine which manifest files to look for.
+
+    Yields:
+        Path: The relative path to the parent directory of a found manifest file,
+        effectively identifying a module root (e.g., "src/backend" or ".").
     """
-    # 1. Get the stream (Lazy)
+
+    # Get the stream (Lazy)
     raw_stream = stream_git_inventory(base_path)
 
     manifests = LANGUAGES_HEURISTICS[language]["manifests"]
 
     for file_path in raw_stream:
-        file_name = os.path.basename(file_path)
-        rel_path = os.path.dirname(file_path)
+        path_obj = Path(file_path)
+        file_name = path_obj.name
+        rel_path = path_obj.parent
 
         if file_name.lower() in manifests:
-            yield rel_path or "."
+            yield rel_path
 
 
-def stream_git_inventory(base_path: FilePath) -> Generator[FilePath, None, None]:
+def stream_git_inventory(base_path: Path) -> Generator[Path, None, None]:
     """
-    Yields files from git index one by one.
-    Zero memory overhead, even for 10 million files.
+    Lazily yields all relevant file paths from the Git index and working tree.
+
+    This function executes `git ls-files` to retrieve a list of files that are either
+    cached (tracked) or untracked but not ignored (respecting `.gitignore`).
+    It uses a subprocess pipe to stream results line-by-line, ensuring memory efficiency
+    for large repositories.
+
+    Args:
+        base_path (Path): The absolute root path of the repository where the git command runs.
+
+    Yields:
+        Path: A relative path object for each file found in the repository.
     """
+
     with subprocess.Popen(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
         cwd=base_path,
@@ -132,17 +203,35 @@ def stream_git_inventory(base_path: FilePath) -> Generator[FilePath, None, None]
     ) as process:
         if process.stdout:
             for p in process.stdout:
-                yield p.strip()
+                yield Path(p.strip())
 
         process.wait()
 
 
-def select_scope(path: FilePath, language: SupportedLanguages) -> List[FilePath]:
+def select_scope(path: Path, language: SupportedLanguages) -> list[str]:
+    """
+    Prompts the user to select which modules (scopes) to include in the scan.
 
-    candidates = list(
-        frozenset(p for p in get_focused_inventory(path, SupportedLanguages(language)))
+    This function first identifies all potential modules using `get_focused_inventory`.
+    If multiple modules are found, it presents an interactive checklist (using `inquirer`)
+    allowing the user to select specific modules or "Select All".
+
+    Args:
+        path (Path): The absolute root path of the repository.
+        language (SupportedLanguages): The selected programming language, used to locate modules.
+
+    Returns:
+        list[str]: A list of relative path strings representing the selected module roots.
+        Returns the original candidate list immediately if "Select All" is chosen or if
+        only one module is found.
+
+    Raises:
+        typer.Exit: If no modules matching the language heuristics are found in the path.
+    """
+
+    candidates = sorted(
+        set(str(p) for p in get_focused_inventory(path, SupportedLanguages(language)))
     )
-    candidates.sort()
 
     if not candidates:
         pr(
@@ -157,9 +246,17 @@ def select_scope(path: FilePath, language: SupportedLanguages) -> List[FilePath]
         "[bold green]Sential found multiple modules. Which ones should we focus on?[/bold green]\n"
     )
 
-    choices = ["Select All"] + [
-        f"{i+1}. {p if p != "." else "(Root)"}" for i, p in enumerate(candidates)
+    # This will look like:
+    # [] Select All
+    # [] (Root)
+    # [] src
+    # [] src/bin
+    # And the value will be the actual path
+    # e.g. (Root) -> "."
+    choices = [("Select All", "ALL")] + [
+        (p if p != "." else "(Root)", p) for p in candidates
     ]
+
     questions = [
         inquirer.Checkbox(
             "Modules",
@@ -167,30 +264,30 @@ def select_scope(path: FilePath, language: SupportedLanguages) -> List[FilePath]
             choices=choices,
         ),
     ]
+
+    # This will contain just the indexes in the above choices list of tuples
     answers = inquirer.prompt(questions, theme=GreenPassion())
 
-    if "Select All" in answers["Modules"]:
+    selection = answers["Modules"]
+
+    # Just return the candidates list
+    if "ALL" in selection:
         return candidates
 
-    selected_indices = [
-        int(x.split(".")[0]) - 1
-        for x in answers["Modules"]
-        if x.split(".")[0].isdigit()
-    ]
-
-    return [
-        # Make this explicit conversion to root path
-        candidates[i] if candidates[i] != "(Root)" else ""
-        for i in selected_indices
-        if 0 <= i < len(candidates)
-    ]
+    return selection
 
 
 def make_language_selection() -> SupportedLanguages:
     """
-    Shows the user a list of supported programming languages
-    from which they can select a single option
+    Interactively prompts the user to select a supported programming language.
+
+    This is invoked when the user does not provide the `--language` argument via the CLI.
+    It displays a list of languages defined in `SupportedLanguages`.
+
+    Returns:
+        SupportedLanguages: The enum member corresponding to the user's selection.
     """
+
     pr(
         "\n[bold green]Select the programming language for which to generate the bridge.[/bold green]"
     )
@@ -207,12 +304,31 @@ def make_language_selection() -> SupportedLanguages:
 
 
 def get_final_inventory_file(
-    base_path: FilePath, scopes: List[FilePath], language: SupportedLanguages
-) -> Tuple[FilePath, FilePath, int, int]:
+    base_path: Path, scopes: list[str], language: SupportedLanguages
+) -> tuple[Path, Path, int, int]:
     """
-    1. Asks Git for files ONLY in the selected scopes.
-    2. Filters them by the language's allowed extensions.
+    Filters the repository files into two distinct categories: Language files and Context files.
+
+    This function runs a filtered `git ls-files` command scoped to the user-selected directories.
+    It iterates through the file stream and assigns files to temporary inventory lists based on:
+    1.  **Language Files:** Files matching the selected language's extensions (e.g., `.ts`, `.py`).
+        These will later be processed by ctags.
+    2.  **Context Files:** High-value text files (e.g., `README.md`, `package.json`) or universal
+        configuration files defined in `UNIVERSAL_CONTEXT_FILES`. These will be read in full.
+
+    Args:
+        base_path (Path): The absolute root path of the repository.
+        scopes (list[str]): A list of relative paths (modules) to restrict the git scan to.
+        language (SupportedLanguages): The target language, used to determine valid code extensions.
+
+    Returns:
+        tuple[Path, Path, int, int]: A tuple containing:
+            1. Path to the temporary file listing all valid Language files.
+            2. Path to the temporary file listing all valid Context files.
+            3. The count of Language files found.
+            4. The count of Context files found.
     """
+
     pr("\n[bold cyan]🔍 Sifting through your codebase...[/bold cyan]")
 
     # Get the allowed extensions (e.g., {'.js', '.ts'})
@@ -267,8 +383,8 @@ def get_final_inventory_file(
             ) as process:
                 if process.stdout:
                     for file_path in process.stdout:
-                        file_path = file_path.strip()
-                        file_name = os.path.basename(file_path).strip().lower()
+                        file_path_obj = Path(file_path.strip())
+                        file_name = file_path_obj.name.lower()
 
                         # Advance the raw counter
                         progress.update(task, advance=1)
@@ -276,17 +392,15 @@ def get_final_inventory_file(
                         # SIEVE 2: Extension Check
                         # Check if file ends with one of our valid extensions
                         # We use endswith because extensions usually include the dot
-                        if any(
-                            file_path.lower().endswith(ext)
-                            for ext in allowed_extensions
-                        ):
+                        if file_path_obj.suffix.lower() in allowed_extensions:
                             lang_file_count += 1
                             lang_file.write(f"{file_path}\n")
 
                         elif (
                             file_name in tier_1_set
-                            or file_name.startswith("readme")
-                            or file_name.endswith(".md")
+                            or "readme" in file_name
+                            or file_path_obj.stem.lower() == "readme"
+                            or file_path_obj.suffix.lower() == ".md"
                         ):
                             ctx_file_count += 1
                             context_file.write(f"{file_path}\n")
@@ -307,19 +421,44 @@ def get_final_inventory_file(
                 completed=total_files,
             )
 
-        return lang_file.name, context_file.name, lang_file_count, ctx_file_count
+        return (
+            Path(lang_file.name),
+            Path(context_file.name),
+            lang_file_count,
+            ctx_file_count,
+        )
 
 
 def generate_tags_jsonl(
-    base_path: str,
-    inventory_path: FilePath,
-    context_path: FilePath,
+    base_path: Path,
+    inventory_path: Path,
+    context_path: Path,
     lang_file_count: int,
     ctx_file_count: int,
     language: SupportedLanguages,
-) -> FilePath:
+) -> Path:
+    """
+    Generates the final JSONL payload containing file contents and code symbols.
 
-    output_path = os.path.join(tempfile.gettempdir(), "sential_payload.jsonl")
+    This function acts as the final assembly line. It performs two main phases:
+    1.  **Context Phase:** Reads the full content of "Context Files" (identified in `get_final_inventory_file`).
+        It prioritizes specific files (like manifests) and writes them to the output first.
+    2.  **Tags Phase:** Invokes `run_ctags` to extract symbols from the "Language Files" listed
+        in the inventory path.
+
+    Args:
+        base_path (Path): The absolute root path of the repository.
+        inventory_path (Path): Path to the temporary file listing language-specific source files.
+        context_path (Path): Path to the temporary file listing context/config files.
+        lang_file_count (int): Total number of language files to process (for progress bars).
+        ctx_file_count (int): Total number of context files to process (for progress bars).
+        language (SupportedLanguages): The target language (used to prioritize specific manifests).
+
+    Returns:
+        Path: The file path to the generated `sential_payload.jsonl` in the system temp directory.
+    """
+
+    output_path = Path(tempfile.gettempdir()) / "sential_payload.jsonl"
 
     pr("\n[bold magenta]📄  Reading context files...[/bold magenta]")
     # Create the Ordered List for the Writer (Preserve Priority)
@@ -331,9 +470,6 @@ def generate_tags_jsonl(
         )
     )
 
-    # We also need the raw set for checking the reader limits later
-    tier_1_set = frozenset(ordered_candidates)
-
     success = False
 
     try:
@@ -343,10 +479,10 @@ def generate_tags_jsonl(
             # --- PHASE 1: CONTEXT FILES (Full Content) ---
 
             # A. Load valid context files found by Git into a set
-            valid_context_files: Set[str] = set()
+            valid_context_path_objs: set[Path] = set()
             with open(context_path, "r", encoding="utf-8") as f:
-                valid_context_files = {
-                    file_path.strip() for file_path in f if file_path.strip()
+                valid_context_path_objs = {
+                    Path(file_path.strip()) for file_path in f if file_path.strip()
                 }
 
             with Progress(
@@ -366,24 +502,24 @@ def generate_tags_jsonl(
                 for candidate in ordered_candidates:
                     # Find matches for this candidate
                     # We create a list of matches so we don't modify the set while iterating
-                    matches = []
-                    for ctx_file_path in valid_context_files:
+                    matches: list[Path] = []
+                    for ctx_file_path_obj in valid_context_path_objs:
 
-                        if os.path.basename(ctx_file_path).lower() == candidate.lower():
-                            matches.append(ctx_file_path)
+                        if ctx_file_path_obj.name.lower() == candidate.lower():
+                            matches.append(ctx_file_path_obj)
 
                     # Sort matches by depth (Root files first!)
                     # "package.json" (depth 0) comes before "backend/package.json" (depth 1)
-                    matches.sort(key=lambda p: p.count(os.sep))
+                    matches.sort(key=lambda p: len(p.parents))
 
                     # Write them and remove from the pool
                     if matches:
                         for match in matches:
-                            full_path = os.path.join(base_path, match)
-                            content = read_file_content(full_path, tier_1_set)
+                            full_path = base_path / match
+                            content = read_file_content(full_path, True)
                             if content:
                                 ctx_record = {
-                                    "path": match,
+                                    "path": str(match),
                                     "type": "context_file",
                                     "content": content,
                                 }
@@ -395,19 +531,19 @@ def generate_tags_jsonl(
                                 )
 
                             # Remove from the main set so it's not handled again
-                            valid_context_files.remove(match)
+                            valid_context_path_objs.remove(match)
 
                 # We handle whatever was left, anything that didn't match prev step
                 leftovers = sorted(
-                    list(valid_context_files), key=lambda p: p.count(os.sep)
+                    list(valid_context_path_objs), key=lambda p: len(p.parents)
                 )
                 for leftover in leftovers:
-                    full_path = os.path.join(base_path, leftover)
-                    content = read_file_content(full_path, tier_1_set)
+                    full_path = base_path / leftover
+                    content = read_file_content(full_path, True)
 
                     if content:
                         ctx_record = {
-                            "path": leftover,
+                            "path": str(leftover),
                             "type": "context_file",
                             "content": content,
                         }
@@ -420,6 +556,8 @@ def generate_tags_jsonl(
                     description=f"[green]✅ Processed {ctx_file_count} context files",
                     completed=ctx_file_count,
                 )
+
+            # --- PHASE 2: PROCESS LANG FILES CTAGS ---
             run_ctags(base_path, inventory_path, out_f, lang_file_count)
         success = True
 
@@ -431,36 +569,36 @@ def generate_tags_jsonl(
         raise typer.Exit()
 
     finally:
-        # Always clean up inventory file
-        if os.path.exists(inventory_path):
-            try:
-                os.remove(inventory_path)
-            except OSError:
-                pass  # Ignore errors during cleanup
+        # Always clean up these temp files
+        inventory_path.unlink(missing_ok=True)
+        context_path.unlink(missing_ok=True)
 
-        # Always clean up context file
-        if os.path.exists(context_path):
-            try:
-                os.remove(context_path)
-            except OSError:
-                pass  # Ignore errors during cleanup
-
-        # Clean up output file if operation was interrupted or failed
-        if not success and os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass  # Ignore errors during cleanup
+        if not success:
+            output_path.unlink(missing_ok=True)
 
     return output_path
 
 
 def run_ctags(
-    base_path: FilePath,
-    inventory_path: FilePath,
+    base_path: Path,
+    inventory_path: Path,
     out_f: io.TextIOWrapper,
     lang_file_count: int,
 ):
+    """
+    Executes Universal Ctags on the provided inventory of files and streams the output to JSONL.
+
+    This function streams file paths from `inventory_path` into the `ctags` subprocess via stdin.
+    It parses the JSON output from ctags, aggregates symbols (tags) by file path, and writes
+    a compressed record (path + list of tags) to the open output file handle `out_f`.
+
+    Args:
+        base_path (Path): The working directory for the ctags subprocess.
+        inventory_path (Path): Path to the temporary file containing the list of source files to scan.
+        out_f (io.TextIOWrapper): An open file handle (write mode) where the JSONL records will be written.
+        lang_file_count (int): The total number of files to process, used for the progress bar.
+    """
+
     pr("\n[bold magenta]🏷️  Extracting code symbols...[/bold magenta]")
 
     ctags = get_ctags_path()
@@ -477,7 +615,7 @@ def run_ctags(
 
     # We accumulate the tags for the current file only
     current_file_path = None
-    current_tags: List[str] = []
+    current_tags: list[str] = []
     tag_count = 0
 
     with Progress(
@@ -556,11 +694,22 @@ def run_ctags(
         )
 
 
-def count_git_files(base_path: str, cmd: List[str]) -> int:
+def count_git_files(base_path: Path, cmd: list[str]) -> int:
     """
-    Counts lines in the output stream without loading the file into memory.
-    Memory Usage: Constant (Zero).
+    Efficiently counts the number of lines (files) in a Git command output.
+
+    This function executes the provided command and streams the output to count newlines
+    without loading the entire output into memory. This is used to calculate totals for
+    progress bars before processing begins.
+
+    Args:
+        base_path (Path): The directory in which to execute the command.
+        cmd (list[str]): The command and its arguments as a list (e.g., `["git", "ls-files"]`).
+
+    Returns:
+        int: The total number of lines/files returned by the command.
     """
+
     count = 0
     # Use Popen to open a pipe, not a buffer
     with subprocess.Popen(
@@ -580,41 +729,47 @@ def count_git_files(base_path: str, cmd: List[str]) -> int:
     return count
 
 
-def read_file_content(filepath: FilePath, tier_1_filenames: FrozenSet[str]) -> str:
+def read_file_content(file_path: Path, is_tier_1: bool = False) -> str:
     """
-    Reads file content with intelligent truncation.
-    - Tier 1 (Manifests/Docs/AI Rules): 100k chars.
-    - Tier 2 (Standard Code): 50k chars.
+    Reads the text content of a file with safety checks and intelligent truncation.
+
+    Binary files are automatically detected and skipped. Text files are read up to a specific
+    character limit based on their importance "Tier".
+    - **Tier 1 (True):** Critical context files (Manifests, Docs). Limit: 100k chars.
+    - **Tier 2 (False):** Standard files. Limit: 50k chars.
+
+    Args:
+        file_path (Path): The absolute path to the file to read.
+        is_tier_1 (bool): If True, applies a higher character limit (100k). If False,
+            applies the standard limit (50k). Defaults to False.
+
+    Returns:
+        str: The content of the file. If the file is binary, non-existent, or an error occurs,
+        returns an empty string. If the content exceeds the limit, it is truncated with a notice.
     """
-
-    filename = os.path.basename(filepath)
-
-    # We check agains what we've defined as tier 1 filenames
-    # allowing for readmes with different extensions and
-    # giving high confidence to .md files regardless
-    is_tier_1 = (
-        filename in tier_1_filenames
-        or filename.lower().startswith("readme")
-        or filename.endswith(".md")
-    )
 
     limit = 100_000 if is_tier_1 else 50_000
 
+    if not file_path.is_file():
+        return ""
+
+    # We skip binary files
+    if is_binary_file(file_path):
+        return ""
+
     try:
-        if not os.path.exists(filepath):
-            return ""
-        # We skip binary files
-        with open(filepath, "rb") as f:
-            if b"\0" in f.read(1024):
-                return ""
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(limit)
-            if len(content) == limit:
-                content += (
-                    f"\n\n... [TRUNCATED BY SENTIAL: File exceeded {limit} chars] ..."
+        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+            # We read limit + 1 so we KNOW if there was more left behind
+            content = f.read(limit + 1)
+
+            if len(content) > limit:
+                return (
+                    content[:limit]
+                    + f"\n\n... [TRUNCATED BY SENTIAL: File exceeded {limit} chars] ..."
                 )
+
             return content
-    except Exception:
+    except OSError:
         return ""
 
 
