@@ -2,6 +2,7 @@
 This is a simple CLI tool that receives a path to a folder and lists all the files in it.
 """
 
+import io
 import json
 import os
 import subprocess
@@ -15,9 +16,9 @@ from rich.progress import (
     TextColumn,
     BarColumn,
     TaskProgressColumn,
-    TimeRemainingColumn,
 )
 import inquirer  # type: ignore
+from inquirer.themes import GreenPassion  # type: ignore
 from ctags import get_ctags_path
 
 from constants import (
@@ -83,14 +84,15 @@ def main(
     pr(f"[green]Scanning: {path}...[/green]\n")
 
     scopes = select_scope(path, SupportedLanguages(language))
-    lang_inventory_path, context_inventory_path, file_count = get_final_inventory_file(
-        path, scopes, SupportedLanguages(language)
+    lang_inventory_path, context_inventory_path, lang_file_count, ctx_file_count = (
+        get_final_inventory_file(path, scopes, SupportedLanguages(language))
     )
     tags_map = generate_tags_jsonl(
         path,
         lang_inventory_path,
         context_inventory_path,
-        file_count,
+        lang_file_count,
+        ctx_file_count,
         SupportedLanguages(language),
     )
     print(tags_map)
@@ -112,7 +114,7 @@ def get_focused_inventory(
         rel_path = os.path.dirname(file_path)
 
         if file_name.lower() in manifests:
-            yield rel_path
+            yield rel_path or "."
 
 
 def stream_git_inventory(base_path: FilePath) -> Generator[FilePath, None, None]:
@@ -152,9 +154,12 @@ def select_scope(path: FilePath, language: SupportedLanguages) -> List[FilePath]
         return [candidates[0]]
 
     pr(
-        "[bold green]Sential found multiple modules. Which ones should we focus on?[/bold green]"
+        "[bold green]Sential found multiple modules. Which ones should we focus on?[/bold green]\n"
     )
-    choices = ["Select All"] + [f"{i+1}. {p}" for i, p in enumerate(candidates)]
+
+    choices = ["Select All"] + [
+        f"{i+1}. {p if p != "." else "(Root)"}" for i, p in enumerate(candidates)
+    ]
     questions = [
         inquirer.Checkbox(
             "Modules",
@@ -162,7 +167,7 @@ def select_scope(path: FilePath, language: SupportedLanguages) -> List[FilePath]
             choices=choices,
         ),
     ]
-    answers = inquirer.prompt(questions)
+    answers = inquirer.prompt(questions, theme=GreenPassion())
 
     if "Select All" in answers["Modules"]:
         return candidates
@@ -173,7 +178,12 @@ def select_scope(path: FilePath, language: SupportedLanguages) -> List[FilePath]
         if x.split(".")[0].isdigit()
     ]
 
-    return [candidates[i] for i in selected_indices if 0 <= i < len(candidates)]
+    return [
+        # Make this explicit conversion to root path
+        candidates[i] if candidates[i] != "(Root)" else ""
+        for i in selected_indices
+        if 0 <= i < len(candidates)
+    ]
 
 
 def make_language_selection() -> SupportedLanguages:
@@ -192,13 +202,13 @@ def make_language_selection() -> SupportedLanguages:
         ),
     ]
 
-    answers = inquirer.prompt(questions)
+    answers = inquirer.prompt(questions, theme=GreenPassion())
     return SupportedLanguages(answers["language"])
 
 
 def get_final_inventory_file(
     base_path: FilePath, scopes: List[FilePath], language: SupportedLanguages
-) -> Tuple[FilePath, FilePath, int]:
+) -> Tuple[FilePath, FilePath, int, int]:
     """
     1. Asks Git for files ONLY in the selected scopes.
     2. Filters them by the language's allowed extensions.
@@ -227,8 +237,8 @@ def get_final_inventory_file(
 
     total_files = count_git_files(base_path, cmd)
 
-    file_count = 0
-    filtered_count = 0
+    lang_file_count = 0
+    ctx_file_count = 0
 
     with tempfile.NamedTemporaryFile(
         mode="w", delete=False, encoding="utf-8"
@@ -240,7 +250,6 @@ def get_final_inventory_file(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task(
                 "[cyan]Scanning files and applying language filter...",
@@ -260,7 +269,6 @@ def get_final_inventory_file(
                     for file_path in process.stdout:
                         file_path = file_path.strip()
                         file_name = os.path.basename(file_path).strip().lower()
-                        file_count += 1
 
                         # Advance the raw counter
                         progress.update(task, advance=1)
@@ -272,6 +280,7 @@ def get_final_inventory_file(
                             file_path.lower().endswith(ext)
                             for ext in allowed_extensions
                         ):
+                            lang_file_count += 1
                             lang_file.write(f"{file_path}\n")
 
                         elif (
@@ -279,14 +288,14 @@ def get_final_inventory_file(
                             or file_name.startswith("readme")
                             or file_name.endswith(".md")
                         ):
+                            ctx_file_count += 1
                             context_file.write(f"{file_path}\n")
                         else:
                             continue
 
-                        filtered_count += 1
                         progress.update(
                             task,
-                            description=f"[cyan]Kept {filtered_count} {language} files...",
+                            description=f"[cyan]Kept {lang_file_count + ctx_file_count} {language} files...",
                         )
 
                 process.wait()
@@ -294,25 +303,25 @@ def get_final_inventory_file(
             # Final update
             progress.update(
                 task,
-                description=f"[green]✓ Found {filtered_count} valid files",
+                description=f"[green]✅ Found {lang_file_count + ctx_file_count} valid files",
                 completed=total_files,
             )
 
-        return lang_file.name, context_file.name, filtered_count
+        return lang_file.name, context_file.name, lang_file_count, ctx_file_count
 
 
 def generate_tags_jsonl(
     base_path: str,
     inventory_path: FilePath,
     context_path: FilePath,
-    total_files: int,
+    lang_file_count: int,
+    ctx_file_count: int,
     language: SupportedLanguages,
 ) -> FilePath:
 
     output_path = os.path.join(tempfile.gettempdir(), "sential_payload.jsonl")
 
-    pr("\n[bold magenta]🏷️  Extracting code symbols...[/bold magenta]")
-
+    pr("\n[bold magenta]📄  Reading context files...[/bold magenta]")
     # Create the Ordered List for the Writer (Preserve Priority)
     # We concatenate the tuples, then use dict.fromkeys to dedup while keeping order.
     # This is O(N) and extremely fast.
@@ -325,48 +334,32 @@ def generate_tags_jsonl(
     # We also need the raw set for checking the reader limits later
     tier_1_set = frozenset(ordered_candidates)
 
-    ctags = get_ctags_path()
-    cmd = [
-        ctags,
-        "--output-format=json",
-        "--sort=no",
-        "--fields=+n",
-        "-f",
-        "-",
-        "-L",
-        "-",
-    ]
-
-    # We accumulate the tags for the current file only
-    current_file_path = None
-    current_tags: List[str] = []
-    tag_count = 0
     success = False
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
 
-            task = progress.add_task(
-                f"[magenta]Parsing symbols from {total_files} files...",
-                total=total_files,
-            )
-            with open(output_path, "w", encoding="utf-8") as out_f:
+        with open(output_path, "w", encoding="utf-8") as out_f:
 
-                # --- PHASE 1: CONTEXT FILES (Full Content) ---
+            # --- PHASE 1: CONTEXT FILES (Full Content) ---
 
-                # A. Load valid context files found by Git into a set
-                valid_context_files: Set[str] = set()
-                with open(context_path, "r", encoding="utf-8") as f:
-                    valid_context_files = {
-                        file_path.strip() for file_path in f if file_path.strip()
-                    }
+            # A. Load valid context files found by Git into a set
+            valid_context_files: Set[str] = set()
+            with open(context_path, "r", encoding="utf-8") as f:
+                valid_context_files = {
+                    file_path.strip() for file_path in f if file_path.strip()
+                }
 
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+            ) as progress:
+
+                task = progress.add_task(
+                    f"[magenta]Reading from {ctx_file_count} context files...",
+                    total=ctx_file_count,
+                )
                 # B. The Priority Pass (Write the VIPs first)
                 # We take each candidate in order, maintaining prio
                 # candidates are names not relative paths
@@ -396,7 +389,9 @@ def generate_tags_jsonl(
                                 }
                                 out_f.write(json.dumps(ctx_record) + "\n")
                                 progress.update(
-                                    task, description=f"[cyan]Included {match}..."
+                                    task,
+                                    description=f"[cyan]Included {match}...",
+                                    advance=1,
                                 )
 
                             # Remove from the main set so it's not handled again
@@ -418,71 +413,15 @@ def generate_tags_jsonl(
                         }
                         out_f.write(json.dumps(ctx_record) + "\n")
                         progress.update(
-                            task, description=f"[cyan]Included {leftover}..."
+                            task, description=f"[cyan]Included {leftover}...", advance=1
                         )
-
-                with open(inventory_path, "r", encoding="utf-8") as in_f:
-                    # Use Popen to stream the output
-                    with subprocess.Popen(
-                        cmd,
-                        cwd=base_path,
-                        stdin=in_f,  # Feed the file list via stdin
-                        stdout=subprocess.PIPE,  # Catch output via pipe
-                        text=True,
-                        bufsize=1,
-                    ) as process:
-
-                        if process.stdout:
-                            for line in process.stdout:
-                                try:
-                                    tag = json.loads(line)
-                                    path = tag.get("path")
-                                    kind = tag.get("kind")
-                                    name = tag.get("name")
-
-                                    if not path or not name or kind not in CTAGS_KINDS:
-                                        continue
-
-                                    if path != current_file_path:
-                                        if current_file_path:
-                                            record = {
-                                                "path": current_file_path,
-                                                "tags": current_tags,
-                                            }
-                                            out_f.write(json.dumps(record) + "\n")
-                                        # Reset for new file
-                                        current_file_path = path
-                                        current_tags = []
-
-                                    # Add tag to current buffer
-                                    current_tags.append(f"{kind} {name}")
-                                    tag_count += 1
-
-                                    # Tick the spinner occasionally
-                                    if tag_count % 100 == 0:
-                                        progress.update(
-                                            task,
-                                            description=f"[magenta]Extracted {tag_count} symbols...",
-                                        )
-
-                                except json.JSONDecodeError:
-                                    continue
-
-                        # Write the last file's tags if any
-                        if current_file_path:
-                            record = {
-                                "path": current_file_path,
-                                "tags": current_tags,
-                            }
-                            out_f.write(json.dumps(record) + "\n")
-
-            progress.update(
-                task,
-                description=f"[green]✓ Extracted {tag_count} symbols",
-                completed=100,
-                total=100,
-            )
-            success = True
+                progress.update(
+                    task,
+                    description=f"[green]✅ Processed {ctx_file_count} context files",
+                    completed=ctx_file_count,
+                )
+            run_ctags(base_path, inventory_path, out_f, lang_file_count)
+        success = True
 
     except KeyboardInterrupt as exc:
         pr("\n[yellow]Interrupted by user[/yellow]")
@@ -514,6 +453,107 @@ def generate_tags_jsonl(
                 pass  # Ignore errors during cleanup
 
     return output_path
+
+
+def run_ctags(
+    base_path: FilePath,
+    inventory_path: FilePath,
+    out_f: io.TextIOWrapper,
+    lang_file_count: int,
+):
+    pr("\n[bold magenta]🏷️  Extracting code symbols...[/bold magenta]")
+
+    ctags = get_ctags_path()
+    cmd = [
+        ctags,
+        "--output-format=json",
+        "--sort=no",
+        "--fields=+n",
+        "-f",
+        "-",
+        "-L",
+        "-",
+    ]
+
+    # We accumulate the tags for the current file only
+    current_file_path = None
+    current_tags: List[str] = []
+    tag_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+    ) as progress:
+
+        task = progress.add_task(
+            f"[magenta]Parsing symbols from {lang_file_count} files...",
+            total=lang_file_count,
+        )
+
+        with open(inventory_path, "r", encoding="utf-8") as in_f:
+            # Use Popen to stream the output
+            with subprocess.Popen(
+                cmd,
+                cwd=base_path,
+                stdin=in_f,  # Feed the file list via stdin
+                stdout=subprocess.PIPE,  # Catch output via pipe
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            ) as process:
+
+                if process.stdout:
+                    for line in process.stdout:
+                        try:
+                            tag = json.loads(line)
+                            path = tag.get("path")
+                            kind = tag.get("kind")
+                            name = tag.get("name")
+
+                            if not path or not name or kind not in CTAGS_KINDS:
+                                continue
+
+                            if path != current_file_path:
+                                if current_file_path:
+                                    record = {
+                                        "path": current_file_path,
+                                        "tags": current_tags,
+                                    }
+                                    out_f.write(json.dumps(record) + "\n")
+                                    progress.update(task, advance=1)
+                                # Reset for new file
+                                current_file_path = path
+                                current_tags = []
+
+                            # Add tag to current buffer
+                            current_tags.append(f"{kind} {name}")
+                            tag_count += 1
+
+                            # Tick the spinner occasionally
+                            if tag_count % 10 == 0:
+                                progress.update(
+                                    task,
+                                    description=f"[magenta]Extracted {tag_count} symbols...",
+                                )
+
+                        except json.JSONDecodeError:
+                            continue
+
+                    # Write the last file's tags if any
+                    if current_file_path:
+                        record = {
+                            "path": current_file_path,
+                            "tags": current_tags,
+                        }
+                        out_f.write(json.dumps(record) + "\n")
+
+        progress.update(
+            task,
+            description=f"[green]✅ Extracted {tag_count} symbols",
+            completed=lang_file_count,
+        )
 
 
 def count_git_files(base_path: str, cmd: List[str]) -> int:
