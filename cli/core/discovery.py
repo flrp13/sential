@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import IO, Generator, Optional
 from adapters.git import GitClient
 from constants import LANGUAGES_HEURISTICS, UNIVERSAL_CONTEXT_FILES
+from core.exceptions import (
+    EmptyInventoryError,
+    TempFileCreationError,
+    TempFileWriteError,
+)
 from core.models import InventoryResult, InventoryStats
 from models import SupportedLanguage
 from ui.progress import ProgressState, create_progress, create_task, update_progress
@@ -106,6 +111,7 @@ class FileInventoryWriter:
         )
         self.lang_file_count = 0
         self.ctx_file_count = 0
+        self.processed_files_chunk = 0
 
         # File handles and paths - set in __enter__, closed in process(), cleaned up in __exit__
         self.lang_file: Optional[IO[str]] = None
@@ -116,18 +122,29 @@ class FileInventoryWriter:
     @property
     def _lang_file(self) -> IO[str]:
         """Type-safe access to lang_file, ensuring context manager was entered."""
-        assert (
-            self.lang_file is not None
-        ), "FileInventoryWriter must be used as a context manager"
+        if self.lang_file is None:
+            raise RuntimeError(
+                "FileInventoryWriter.lang_file is not initialized. "
+                "Did you forget to use 'with FileInventoryWriter(...) as writer'?"
+            )
         return self.lang_file
 
     @property
     def _context_file(self) -> IO[str]:
         """Type-safe access to context_file, ensuring context manager was entered."""
-        assert (
-            self.context_file is not None
-        ), "FileInventoryWriter must be used as a context manager"
+        if self.context_file is None:
+            raise RuntimeError(
+                "FileInventoryWriter.context_file is not initialized. "
+                "Did you forget to use 'with FileInventoryWriter(...) as writer'?"
+            )
         return self.context_file
+
+    @property
+    def _advance(self) -> int:
+        """We use this to define the advance amount for progress bar"""
+        if self.total_files <= 100:
+            return 1
+        return 5 * (len(str(self.total_files)) - 1)
 
     def __enter__(self):
         """
@@ -137,14 +154,17 @@ class FileInventoryWriter:
             self: Returns the instance for use in 'with' statements.
         """
         # Create temp files - we'll manage their lifecycle explicitly
-        self.lang_file = tempfile.NamedTemporaryFile(
-            mode="w", delete=False, encoding="utf-8"
-        )
-        self.context_file = tempfile.NamedTemporaryFile(
-            mode="w", delete=False, encoding="utf-8"
-        )
-        self.lang_file_path = Path(self.lang_file.name)
-        self.context_file_path = Path(self.context_file.name)
+        try:
+            self.lang_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, encoding="utf-8"
+            )
+            self.context_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, encoding="utf-8"
+            )
+            self.lang_file_path = Path(self.lang_file.name)
+            self.context_file_path = Path(self.context_file.name)
+        except OSError as e:
+            raise TempFileCreationError from e
         return self
 
     def __exit__(self, *args):
@@ -172,47 +192,74 @@ class FileInventoryWriter:
             InventoryResult containing paths to inventory files and file counts.
 
         Raises:
-            AssertionError: If not used as a context manager (files not initialized).
+            EmptyInventoryError: If no files are found in the repository matching the
+                specified language and scopes.
+            RuntimeError: If not used as a context manager (files not initialized).
         """
-        with create_progress() as progress:
-            task = create_task(
-                progress,
-                "Scanning files and applying language filter...",
-                total=self.total_files,
+        # Handle empty repository or empty scopes - raise exception to stop processing
+        if self.total_files == 0:
+            raise EmptyInventoryError(
+                "No files found in the repository matching the specified language and scopes"
             )
-            for file_path in self.file_stream:
-                # Advance the raw counter
-                update_progress(progress, task, advance=1)
 
-                # Check file category to know which file to write it to
-                category = classify_file(
-                    file_path, self.allowed_extensions, self.allowed_context_files
+        try:
+            with create_progress() as progress:
+                task = create_task(
+                    progress,
+                    "Scanning files and applying language filter...",
+                    total=self.total_files,
                 )
-                self._write_to_file_by_category(file_path, category)
+                for file_path in self.file_stream:
 
+                    # Check file category to know which file to write it to
+                    category = classify_file(
+                        file_path, self.allowed_extensions, self.allowed_context_files
+                    )
+                    self._write_to_file_by_category(file_path, category)
+
+                    self.processed_files_chunk += 1
+
+                    if self.processed_files_chunk == self._advance:
+                        # Advance the raw counter
+                        update_progress(progress, task, advance=self._advance)
+                        update_progress(
+                            progress,
+                            task,
+                            ProgressState.IN_PROGRESS,
+                            description=f"Kept {self.lang_file_count + self.ctx_file_count} {self.language} files...",
+                        )
+                        self.processed_files_chunk = 0
+
+                # Final update - progress bar completes when 'with' block exits
                 update_progress(
                     progress,
                     task,
-                    ProgressState.IN_PROGRESS,
-                    description=f"Kept {self.lang_file_count + self.ctx_file_count} {self.language} files...",
+                    ProgressState.COMPLETE,
+                    description=f"✅ Found {self.lang_file_count + self.ctx_file_count} valid files",
+                    completed=self.total_files,
                 )
-
-            # Final update - progress bar completes when 'with' block exits
-            update_progress(
-                progress,
-                task,
-                ProgressState.COMPLETE,
-                description=f"✅ Found {self.lang_file_count + self.ctx_file_count} valid files",
-                completed=self.total_files,
-            )
-
-        # Close file handles explicitly - closing flushes automatically
-        # Files remain on disk (delete=False) for generate_tags_jsonl() to read
-        self._lang_file.close()
-        self._context_file.close()
+        finally:
+            # Close file handles explicitly - closing flushes automatically
+            # Files remain on disk (delete=False) for generate_tags_jsonl() to read
+            # Access attributes directly (not properties) to avoid RuntimeError in cleanup
+            # Use try/except to avoid masking original exceptions if close() fails
+            if self.lang_file is not None:
+                try:
+                    self.lang_file.close()
+                except OSError:
+                    pass
+            if self.context_file is not None:
+                try:
+                    self.context_file.close()
+                except OSError:
+                    pass
 
         # Type narrowing: paths are set in __enter__, so they're guaranteed non-None here
-        assert self.lang_file_path is not None and self.context_file_path is not None
+        if self.lang_file_path is None or self.context_file_path is None:
+            raise RuntimeError(
+                "Inventory paths were not initialized. This usually means "
+                "the process() method was called outside of a valid context."
+            )
 
         return InventoryResult(
             self.lang_file_path,
@@ -233,15 +280,18 @@ class FileInventoryWriter:
             file_path: Relative path to the file to write.
             category: Classification category determining which inventory file to use.
         """
-        match category:
-            case FileCategory.LANGUAGE:
-                self.lang_file_count += 1
-                self._lang_file.write(f"{file_path}\n")
-            case FileCategory.CONTEXT:
-                self.ctx_file_count += 1
-                self._context_file.write(f"{file_path}\n")
-            case _:
-                pass
+        try:
+            match category:
+                case FileCategory.LANGUAGE:
+                    self.lang_file_count += 1
+                    self._lang_file.write(f"{file_path}\n")
+                case FileCategory.CONTEXT:
+                    self.ctx_file_count += 1
+                    self._context_file.write(f"{file_path}\n")
+                case _:
+                    pass
+        except IOError as e:
+            raise TempFileWriteError from e
 
 
 def classify_file(

@@ -89,7 +89,8 @@ class GitClient:
         self, scopes: Optional[list[str]] = None
     ) -> Generator[Path, None, None]:
         """
-        Lazily yield all relevant file paths from the Git index and working tree.
+        Lazily yield all relevant file paths from the Git index and working tree
+        in ascending alphabetical order.
 
         This method executes `git ls-files` to retrieve a list of files that are either
         cached (tracked) or untracked but not ignored (respecting `.gitignore`).

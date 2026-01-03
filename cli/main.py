@@ -40,6 +40,7 @@ from rich import print as pr
 from adapters.git import GitClient
 from constants import SupportedLanguage
 from core.discovery import FileInventoryWriter
+from core.exceptions import EmptyInventoryError, TempFileError
 from core.extraction import generate_tags_jsonl
 from ui.prompts import make_language_selection, select_scope
 
@@ -92,7 +93,7 @@ def main(
         raise typer.Exit()
 
     try:
-        language = _normalize_language(language)
+        language = normalize_language(language)
     except ValueError as exc:
         pr(
             f"[red]Error:[/red] Selected language not supported ([green]'{language}'[/green]),\n run [italic]sential --help[/italic] to see a list of supported languages."
@@ -103,18 +104,23 @@ def main(
     pr(f"[green]Scanning: {path}...[/green]\n")
 
     scopes = select_scope(path, language)
-    with FileInventoryWriter(path, scopes, language) as writer:
-        pr("\n[bold magenta]🔍 Sifting through your codebase...")
-        inventory_result = writer.process()
-        tags_map = generate_tags_jsonl(
-            path,
-            inventory_result,
-            language,
-        )
-        print(tags_map)
+    try:
+        with FileInventoryWriter(path, scopes, language) as writer:
+            pr("\n[bold magenta]🔍 Sifting through your codebase...")
+            inventory_result = writer.process()
+            tags_map = generate_tags_jsonl(
+                path,
+                inventory_result,
+                language,
+            )
+            print(tags_map)
+    except EmptyInventoryError as e:
+        print_empty_inventory_err(e, language)
+    except TempFileError as e:
+        print_temp_file_err(e)
 
 
-def _normalize_language(language: Optional[str]) -> SupportedLanguage:
+def normalize_language(language: Optional[str]) -> SupportedLanguage:
     # Validate language selection
     if not language or not language.strip():
         # If language not passed as arg, show options
@@ -125,8 +131,33 @@ def _normalize_language(language: Optional[str]) -> SupportedLanguage:
     for l in SupportedLanguage:
         if l.lower() == language:
             return l
-
     raise ValueError
+
+
+def print_empty_inventory_err(
+    e: EmptyInventoryError, language: SupportedLanguage
+) -> None:
+    pr("[yellow]⚠️  No files found[/yellow]")
+    pr(
+        f"No files matching [green]{language}[/green] were found in the selected scopes."
+    )
+    pr(
+        "\n[yellow]Tip:[/yellow] Try selecting different scopes or verify the repository contains files for this language."
+    )
+    raise typer.Exit(code=1) from e
+
+
+def print_temp_file_err(e: TempFileError) -> None:
+    pr("❌ [bold red]Workspace Error[/bold red]")
+    pr("The app couldn't create the temporary files needed to run.")
+    pr(
+        "\n[yellow]Quick Fix:[/yellow] Ensure your temp folder is writable and you have free disk space."
+    )
+
+    pr("\n--- PLEASE REPORT THIS ---")
+    pr(f"Error Context: {e}")
+    pr(f"Diagnostics: {e.diagnostic_info}")
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

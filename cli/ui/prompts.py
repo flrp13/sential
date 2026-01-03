@@ -24,14 +24,15 @@ def select_scope(path: Path, language: SupportedLanguage) -> list[str]:
     Returns:
         list[str]: A list of relative path strings representing the selected module roots.
         Returns the original candidate list immediately if "Select All" is chosen or if
-        only one module is found.
+        only one module is found. Nested child modules are automatically filtered out
+        if their parent is already selected.
 
     Raises:
         typer.Exit: If no modules matching the language heuristics are found in the path.
     """
 
     candidates = sorted(
-        set(str(p) for p in get_focused_inventory(path, SupportedLanguage(language)))
+        list(p for p in get_focused_inventory(path, SupportedLanguage(language)))
     )
 
     if not candidates:
@@ -41,22 +42,15 @@ def select_scope(path: Path, language: SupportedLanguage) -> list[str]:
         raise typer.Exit()
 
     if len(candidates) == 1:
-        return [candidates[0]]
+        return [str(candidates[0])]
 
     pr(
         "[bold green]Sential found multiple modules. Which ones should we focus on?[/bold green]\n"
     )
 
-    # This will look like:
-    # [] Select All
-    # [] (Root)
-    # [] src
-    # [] src/bin
-    # And the value will be the actual path
-    # e.g. (Root) -> "."
-    choices = [("Select All", "ALL")] + [
-        (p if p != "." else "(Root)", p) for p in candidates
-    ]
+    # Build choices: if "." is in candidates, display it as "Select All"
+    # Otherwise, display paths as-is
+    choices = [(str(p) if str(p) != "." else "Select All", p) for p in candidates]
 
     questions = [
         inquirer.Checkbox(
@@ -66,18 +60,37 @@ def select_scope(path: Path, language: SupportedLanguage) -> list[str]:
         ),
     ]
 
-    # This will contain just the indexes in the above choices list of tuples
     answers = inquirer.prompt(questions, theme=GreenPassion())
     if not answers:
         raise typer.Exit()
 
-    selection = answers["Modules"]
+    selection: list[Path] = answers["Modules"]
 
-    # Just return the candidates list
-    if "ALL" in selection:
-        return candidates
+    # If "." (Select All) is selected, return it
+    if Path(".") in selection:
+        return ["."]
 
-    return selection
+    # Filter out nested child modules if their parent is already selected
+    filtered_selection: list[str] = []
+
+    # If a parent of current scope_path is already in filtered_selection
+    # we don't need to add its children, since it's redundant
+    # for this logic to work we rely on the fact that candidates
+    # is sorted ascending
+    for scope_path in selection:
+        is_parent_in_filtered_selection = False
+        for p in filtered_selection:
+            try:
+                scope_path.relative_to(Path(p))
+                is_parent_in_filtered_selection = True
+            except ValueError:
+                pass
+
+        if not is_parent_in_filtered_selection:
+            filtered_selection.append(str(scope_path))
+
+    pr(f"\n\n[bold green]FILTERED SELECTION: {filtered_selection}\n\n")
+    return filtered_selection
 
 
 def make_language_selection() -> SupportedLanguage:
