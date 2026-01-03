@@ -11,16 +11,9 @@ import io
 import json
 import subprocess
 import tempfile
-import typer
 from pathlib import Path
+import typer
 from rich import print as pr
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    BarColumn,
-    TaskProgressColumn,
-)
 from adapters.ctags import get_ctags_path
 from constants import (
     CTAGS_KINDS,
@@ -178,10 +171,8 @@ def generate_tags_jsonl(
         raise typer.Exit()
 
     finally:
-        # Always clean up these temp files
-        source_path.unlink(missing_ok=True)
-        context_path.unlink(missing_ok=True)
-
+        # Clean up output file only if generation failed
+        # Temp inventory files (source_path, context_path) are cleaned up by FileInventoryWriter context manager
         if not success:
             output_path.unlink(missing_ok=True)
 

@@ -39,7 +39,7 @@ import typer
 from rich import print as pr
 from adapters.git import GitClient
 from constants import SupportedLanguage
-from core.discovery import get_final_inventory_file
+from core.discovery import FileInventoryWriter
 from core.extraction import generate_tags_jsonl
 from ui.prompts import make_language_selection, select_scope
 
@@ -103,13 +103,15 @@ def main(
     pr(f"[green]Scanning: {path}...[/green]\n")
 
     scopes = select_scope(path, language)
-    inventory_result = get_final_inventory_file(path, scopes, language)
-    tags_map = generate_tags_jsonl(
-        path,
-        inventory_result,
-        language,
-    )
-    print(tags_map)
+    with FileInventoryWriter(path, scopes, language) as writer:
+        pr("\n[bold magenta]🔍 Sifting through your codebase...")
+        inventory_result = writer.process()
+        tags_map = generate_tags_jsonl(
+            path,
+            inventory_result,
+            language,
+        )
+        print(tags_map)
 
 
 def _normalize_language(language: Optional[str]) -> SupportedLanguage:

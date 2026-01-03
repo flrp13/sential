@@ -10,8 +10,7 @@ temporary inventory files that are used by downstream processing stages.
 from enum import Enum
 import tempfile
 from pathlib import Path
-from typing import Generator
-from rich import print as pr
+from typing import IO, Generator, Optional
 from adapters.git import GitClient
 from constants import LANGUAGES_HEURISTICS, UNIVERSAL_CONTEXT_FILES
 from core.models import InventoryResult, InventoryStats
@@ -70,125 +69,201 @@ def get_focused_inventory(
             yield rel_path
 
 
-def get_final_inventory_file(
-    base_path: Path, scopes: list[str], language: SupportedLanguage
-) -> InventoryResult:
+class FileInventoryWriter:
     """
-    Filters the repository files into two distinct categories: Language files and Context files.
+    Context manager that scans a Git repository and generates inventory files.
 
-    This function runs a filtered `git ls-files` command scoped to the user-selected directories.
-    It iterates through the file stream and assigns files to temporary inventory lists based on:
-    1.  **Language Files:** Files matching the selected language's extensions (e.g., `.ts`, `.py`).
-        These will later be processed by ctags.
-    2.  **Context Files:** High-value text files (e.g., `README.md`, `package.json`) or universal
-        configuration files defined in `UNIVERSAL_CONTEXT_FILES`. These will be read in full.
+    Classifies files into language files (source code) and context files (docs, configs)
+    based on language-specific heuristics. Writes file paths to temporary inventory files
+    that are consumed by downstream processing stages.
 
-    Args:
-        base_path (Path): The absolute root path of the repository.
-        scopes (list[str]): A list of relative paths (modules) to restrict the git scan to.
-        language (SupportedLanguages): The target language, used to determine valid code extensions.
-
-    Returns:
-        InventoryResult: An immutable result object containing:
-            - source_inventory_path: Path to temporary file with language file paths
-            - context_inventory_path: Path to temporary file with context file paths
-            - stats: InventoryStats with counts of files in each category
-
-    Note:
-        The returned temporary files contain newline-separated relative file paths.
-        The caller is responsible for cleaning up these temporary files after use.
+    Must be used as a context manager. The context manager handles cleanup of
+    temporary files after processing completes.
     """
 
-    pr("\n[bold magenta]🔍 Sifting through your codebase...")
+    def __init__(self, root_path: Path, scopes: list[str], language: SupportedLanguage):
+        """
+        Initialize the file inventory writer.
 
-    # Get the allowed extensions (e.g., {'.js', '.ts'})
-    allowed_extensions = LANGUAGES_HEURISTICS[language]["extensions"]
+        Args:
+            root_path: Root directory of the Git repository to scan.
+            scopes: List of relative paths to restrict scanning to specific directories.
+            language: Target programming language for file classification.
+        """
+        self.root_path = root_path
+        self.scopes = scopes
+        self.language = language
+        self.git_client = GitClient(self.root_path)
+        self.total_files = self.git_client.count_files(self.scopes)
+        self.file_stream = self.git_client.stream_file_paths(self.scopes)
+        # Get the allowed extensions (e.g., {'.js', '.ts'})
+        self.allowed_extensions = LANGUAGES_HEURISTICS[self.language]["extensions"]
 
-    # Create the fast lookup set for the Reader (O(1) checks)
-    tier_1_set: frozenset[str] = (
-        frozenset(UNIVERSAL_CONTEXT_FILES) | LANGUAGES_HEURISTICS[language]["manifests"]
-    )
+        # Create the fast lookup set for the Reader (O(1) checks)
+        self.allowed_context_files: frozenset[str] = (
+            frozenset(UNIVERSAL_CONTEXT_FILES)
+            | LANGUAGES_HEURISTICS[self.language]["manifests"]
+        )
+        self.lang_file_count = 0
+        self.ctx_file_count = 0
 
-    git_client = GitClient(base_path)
-    total_files = git_client.count_files(scopes)
-    file_stream = git_client.stream_file_paths(scopes)
-    lang_file_count = 0
-    ctx_file_count = 0
+        # File handles and paths - set in __enter__, closed in process(), cleaned up in __exit__
+        self.lang_file: Optional[IO[str]] = None
+        self.context_file: Optional[IO[str]] = None
+        self.lang_file_path: Optional[Path] = None
+        self.context_file_path: Optional[Path] = None
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", delete=False, encoding="utf-8"
-    ) as lang_file, tempfile.NamedTemporaryFile(
-        mode="w", delete=False, encoding="utf-8"
-    ) as context_file:
+    @property
+    def _lang_file(self) -> IO[str]:
+        """Type-safe access to lang_file, ensuring context manager was entered."""
+        assert (
+            self.lang_file is not None
+        ), "FileInventoryWriter must be used as a context manager"
+        return self.lang_file
+
+    @property
+    def _context_file(self) -> IO[str]:
+        """Type-safe access to context_file, ensuring context manager was entered."""
+        assert (
+            self.context_file is not None
+        ), "FileInventoryWriter must be used as a context manager"
+        return self.context_file
+
+    def __enter__(self):
+        """
+        Create temporary inventory files for writing file paths.
+
+        Returns:
+            self: Returns the instance for use in 'with' statements.
+        """
+        # Create temp files - we'll manage their lifecycle explicitly
+        self.lang_file = tempfile.NamedTemporaryFile(
+            mode="w", delete=False, encoding="utf-8"
+        )
+        self.context_file = tempfile.NamedTemporaryFile(
+            mode="w", delete=False, encoding="utf-8"
+        )
+        self.lang_file_path = Path(self.lang_file.name)
+        self.context_file_path = Path(self.context_file.name)
+        return self
+
+    def __exit__(self, *args):
+        """
+        Clean up temporary inventory files.
+
+        Files are already closed by process(), so this only removes the temp files
+        from disk. Called automatically when exiting the 'with' block.
+        """
+        # Context manager only handles cleanup - files are already closed by process()
+        if self.lang_file_path and self.lang_file_path.exists():
+            self.lang_file_path.unlink(missing_ok=True)
+        if self.context_file_path and self.context_file_path.exists():
+            self.context_file_path.unlink(missing_ok=True)
+
+    def process(self) -> InventoryResult:
+        """
+        Scan repository files and generate inventory files.
+
+        Iterates through all files in the repository, classifies them by category,
+        and writes file paths to temporary inventory files. Closes file handles
+        before returning so the files can be read by downstream processes.
+
+        Returns:
+            InventoryResult containing paths to inventory files and file counts.
+
+        Raises:
+            AssertionError: If not used as a context manager (files not initialized).
+        """
         with create_progress() as progress:
             task = create_task(
                 progress,
                 "Scanning files and applying language filter...",
-                total=total_files,
+                total=self.total_files,
             )
-
-            for file_path in file_stream:
+            for file_path in self.file_stream:
                 # Advance the raw counter
                 update_progress(progress, task, advance=1)
 
                 # Check file category to know which file to write it to
-                category = _classify_file(file_path, allowed_extensions, tier_1_set)
-                if category == FileCategory.LANGUAGE:
-                    lang_file_count += 1
-                    lang_file.write(f"{file_path}\n")
-
-                elif category == FileCategory.CONTEXT:
-                    ctx_file_count += 1
-                    context_file.write(f"{file_path}\n")
+                category = classify_file(
+                    file_path, self.allowed_extensions, self.allowed_context_files
+                )
+                self._write_to_file_by_category(file_path, category)
 
                 update_progress(
                     progress,
                     task,
                     ProgressState.IN_PROGRESS,
-                    description=f"Kept {lang_file_count + ctx_file_count} {language} files...",
+                    description=f"Kept {self.lang_file_count + self.ctx_file_count} {self.language} files...",
                 )
 
-            # Final update
+            # Final update - progress bar completes when 'with' block exits
             update_progress(
                 progress,
                 task,
                 ProgressState.COMPLETE,
-                description=f"✅ Found {lang_file_count + ctx_file_count} valid files",
-                completed=total_files,
+                description=f"✅ Found {self.lang_file_count + self.ctx_file_count} valid files",
+                completed=self.total_files,
             )
 
+        # Close file handles explicitly - closing flushes automatically
+        # Files remain on disk (delete=False) for generate_tags_jsonl() to read
+        self._lang_file.close()
+        self._context_file.close()
+
+        # Type narrowing: paths are set in __enter__, so they're guaranteed non-None here
+        assert self.lang_file_path is not None and self.context_file_path is not None
+
         return InventoryResult(
-            Path(lang_file.name),
-            Path(context_file.name),
+            self.lang_file_path,
+            self.context_file_path,
             InventoryStats(
-                lang_file_count,
-                ctx_file_count,
+                self.lang_file_count,
+                self.ctx_file_count,
             ),
         )
 
+    def _write_to_file_by_category(
+        self, file_path: Path, category: FileCategory
+    ) -> None:
+        """
+        Write file path to the appropriate inventory file based on category.
 
-def _classify_file(
-    path: Path, allowed_extensions: frozenset[str], tier_1_context: frozenset[str]
+        Args:
+            file_path: Relative path to the file to write.
+            category: Classification category determining which inventory file to use.
+        """
+        match category:
+            case FileCategory.LANGUAGE:
+                self.lang_file_count += 1
+                self._lang_file.write(f"{file_path}\n")
+            case FileCategory.CONTEXT:
+                self.ctx_file_count += 1
+                self._context_file.write(f"{file_path}\n")
+            case _:
+                pass
+
+
+def classify_file(
+    path: Path,
+    allowed_extensions: frozenset[str],
+    allowed_context_files: frozenset[str],
 ) -> FileCategory:
     """
-    Classify a file into one of the FileCategory enum values.
+    Classify a file path into a category based on extension and name.
 
-    This pure function implements the classification logic used during file discovery.
-    It checks file extensions and names against the provided sets to determine
-    whether a file is source code, context, or should be ignored.
+    Classification priority:
+    1. LANGUAGE: If file extension matches allowed extensions for the target language.
+    2. CONTEXT: If file name matches known context files, starts with "readme", or is a .md file.
+    3. IGNORE: All other files.
 
     Args:
-        path: The Path object representing the file to classify.
-        allowed_extensions: Set of file extensions (with dots, e.g., ".py", ".ts")
-            that identify source code files for the target language.
-        tier_1_context: Set of filenames (lowercase) that are considered high-priority
-            context files, including universal context files and language-specific manifests.
+        path: File path to classify.
+        allowed_extensions: Set of file extensions that match the target language.
+        allowed_context_files: Set of file names that are considered context files.
 
     Returns:
-        FileCategory: The classification result:
-            - LANGUAGE if the file extension matches allowed_extensions
-            - CONTEXT if the filename is in tier_1_context, starts with "readme", or has .md extension
-            - IGNORE otherwise
+        FileCategory enum value indicating how the file should be processed.
     """
     file_name = path.name.lower()
     suffix = path.suffix.lower()
@@ -198,7 +273,11 @@ def _classify_file(
         return FileCategory.LANGUAGE
 
     # Check Context
-    if file_name in tier_1_context or file_name.startswith("readme") or suffix == ".md":
+    if (
+        file_name in allowed_context_files
+        or file_name.startswith("readme")
+        or suffix == ".md"
+    ):
         return FileCategory.CONTEXT
 
     return FileCategory.IGNORE
