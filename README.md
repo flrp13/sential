@@ -1,6 +1,6 @@
 # Sential
 
-**Sential is Source Available. It is free for personal use and open for contribution. For commercial use in teams > 3, please [contact us] or see LICENSE.**
+**Sential is Source Available. It is free for personal use and open for contribution. For commercial use in teams > 3, please [contact us](mailto:florin@sential.ai) or see LICENSE.**
 
 Sential is a local-first tool designed to generate high-signal context bridges from Git repositories. It helps developers quickly understand codebases by intelligently filtering and extracting the most relevant code symbols and context files, then synthesizing comprehensive onboarding guides through a sophisticated two-phase architecture.
 
@@ -167,4 +167,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Contact
 
-For commercial licensing inquiries, please [contact us].
+For commercial licensing inquiries, please [contact us](mailto:florin@sential.ai).
