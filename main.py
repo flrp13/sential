@@ -34,6 +34,7 @@ Dependencies:
 """
 
 from pathlib import Path
+import pathlib
 from typing import Annotated, Optional
 import typer
 from rich import print as pr
@@ -60,12 +61,10 @@ def main(
             resolve_path=True,  # Automatically converts to absolute path
             help="Root path from which Sential will start identifying modules",
         ),
-    ] = Path("."),
+    ] = pathlib.Path().resolve(),  # If not provided, chose the path where the user ran the command
     language: Annotated[
         Optional[str],
-        typer.Option(
-            help=f"Available languages: {', '.join([l for l in SupportedLanguage])}"
-        ),
+        typer.Option(help=f"Available languages: {', '.join(list(SupportedLanguage))}"),
     ] = None,
 ):
     """
@@ -93,13 +92,13 @@ def main(
         pr(f"[red]Error:[/red] Not a git repository: [green]'{path}'[/green]")
         raise typer.Exit()
 
+    # Validate language passed by user
+    # If not passed, open language selection
     try:
         language = normalize_language(language)
-    except ValueError as exc:
-        pr(
-            f"[red]Error:[/red] Selected language not supported ([green]'{language}'[/green]),\n run [italic]sential --help[/italic] to see a list of supported languages."
-        )
-        raise typer.Exit() from exc
+    except ValueError:
+        pr(f"\n[red bold]Not a valid language: {language}")
+        language = make_language_selection()
 
     pr(f"\n[green]Language selected: {language}...[/green]\n")
     pr(f"[green]Scanning: {path}...[/green]\n")
@@ -127,9 +126,9 @@ def normalize_language(language: Optional[str]) -> SupportedLanguage:
     """
     Normalizes and validates a language string to a SupportedLanguage enum value.
 
-    If no language is provided or the string is empty, prompts the user interactively
-    to select a language. Otherwise, performs case-insensitive matching against
-    the supported languages and returns the matching enum value.
+    Performs case-insensitive matching against the supported languages and returns
+    the matching enum value. If no language is provided (None or empty string) or
+    the string doesn't match any supported language, raises ValueError.
 
     Args:
         language (Optional[str]): The language string to normalize. Can be None,
@@ -139,19 +138,18 @@ def normalize_language(language: Optional[str]) -> SupportedLanguage:
         SupportedLanguage: The matching SupportedLanguage enum value.
 
     Raises:
-        ValueError: If the provided language string doesn't match any supported
-            language (case-insensitive).
+        ValueError: If no language is provided (None or empty string) or if the
+            provided language string doesn't match any supported language
+            (case-insensitive).
     """
     # Validate language selection
-    if not language or not language.strip():
-        # If language not passed as arg, show options
-        return make_language_selection()
+    if language:
 
-    language = language.strip().lower()
+        language = language.strip().lower()
 
-    for l in SupportedLanguage:
-        if l.lower() == language:
-            return l
+        for l in SupportedLanguage:
+            if l.lower() == language:
+                return l
     raise ValueError
 
 
